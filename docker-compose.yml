@@ -1,0 +1,52 @@
+services:
+  # ── Database ──────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: zbeam-postgres
+    environment:
+      POSTGRES_DB: zbeam_db
+      POSTGRES_USER: zbeam_user
+      POSTGRES_PASSWORD: zbeam_password
+    ports:
+      - "5434:5432"
+    volumes:
+      - zbeam_postgres_data:/var/lib/postgresql/data
+    networks:
+      - zbeam-net
+    restart: unless-stopped
+
+  # ── Zbeam (Auth Service) ──────────────────────────────────────────────────────
+  zbeam:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zbeam
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql://zbeam_user:zbeam_password@postgres:5432/zbeam_db
+      JWT_PRIVATE_KEY_PATH: /app/keys/auth-private.pem
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
+      ZCLOUD_URL: ${ZCLOUD_URL:-http://localhost:8003}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_PRICE_ID: ${STRIPE_PRICE_ID:-}
+      STRIPE_SUCCESS_URL: ${STRIPE_SUCCESS_URL:-http://localhost:5173/success}
+      STRIPE_CANCEL_URL: ${STRIPE_CANCEL_URL:-http://localhost:5173/cancel}
+      RUST_LOG: zbeam=info,tower_http=debug
+    volumes:
+      - zbeam_keys:/app/keys
+    depends_on:
+      - postgres
+    networks:
+      - zbeam-net
+    restart: unless-stopped
+
+networks:
+  zbeam-net:
+    driver: bridge
+
+volumes:
+  zbeam_postgres_data:
+  zbeam_keys:
