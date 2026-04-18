@@ -21,7 +21,10 @@ impl RateLimiter {
 
     /// Returns `true` if the request is allowed, `false` if the limit is exceeded.
     pub fn check(&self, key: &str) -> bool {
-        let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.state.lock().unwrap_or_else(|e| {
+            eprintln!("WARNING: rate limiter mutex was poisoned; recovering — state may be inconsistent");
+            e.into_inner()
+        });
         let now = Instant::now();
         let entry = map.entry(key.to_string()).or_insert((0, now));
         if now.duration_since(entry.1) >= self.window {
