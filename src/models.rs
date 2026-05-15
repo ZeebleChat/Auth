@@ -52,6 +52,7 @@ pub struct AccessClaims {
     pub account_type: String,
     pub premium: bool,
     pub verified: bool,
+    pub age_verified: bool,
     pub exp: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<String>, // audience — set to target server URL when exchanging
@@ -83,7 +84,8 @@ pub struct RegisterRequest {
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
-    pub beam_identity: String,
+    pub beam_identity: Option<String>,
+    pub email: Option<String>,
     pub password: Option<String>,
     pub totp_code: Option<String>,
 }
@@ -167,6 +169,24 @@ pub struct ResetPasswordWithPinRequest {
     pub new_password: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ParentalControls {
+    #[serde(default = "bool_true")]
+    pub can_join_servers: bool,
+    #[serde(default = "bool_true")]
+    pub can_leave_servers: bool,
+    #[serde(default = "bool_true")]
+    pub can_dm: bool,
+}
+
+impl Default for ParentalControls {
+    fn default() -> Self {
+        Self { can_join_servers: true, can_leave_servers: true, can_dm: true }
+    }
+}
+
+fn bool_true() -> bool { true }
+
 #[derive(Deserialize)]
 pub struct SubActionRequest {
     pub parent_token: String,
@@ -180,6 +200,7 @@ pub enum SubAction {
     Lock,
     Unlock,
     ResetPassword { new_password: String },
+    SetParentalControls { controls: ParentalControls },
 }
 
 #[derive(Deserialize)]
@@ -284,7 +305,10 @@ pub struct AccountInfoResponse {
     pub account_type: String,
     pub premium: bool,
     pub verified: bool,
+    pub age_verified: bool,
+    pub ichor_balance: i64,
     pub discord_linked: bool,
+    pub steam_linked: bool,
     pub auth_methods: Vec<String>,
     pub alts: Vec<SubAccountSummary>,
     pub children: Vec<SubAccountSummary>,
@@ -319,6 +343,8 @@ pub struct SubAccountSummary {
     pub display_name: String,
     pub account_type: String,
     pub locked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parental_controls: Option<ParentalControls>,
 }
 
 #[derive(Serialize)]

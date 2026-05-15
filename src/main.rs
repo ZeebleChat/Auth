@@ -43,9 +43,19 @@ use handlers::{
         send_email_pin, verify_email_pin,
         send_password_reset_pin, reset_password_with_pin,
     },
+    admin::{
+        admin_me, admin_stats, admin_list_users, admin_lock_user, admin_unlock_user,
+        admin_list_staff, admin_add_staff, admin_remove_staff,
+        admin_list_promos, admin_create_promo, admin_delete_promo,
+        admin_list_bans, admin_list_broadcasts, admin_send_broadcast, admin_list_servers,
+        admin_delete_server,
+    },
+    amps::{apply_amp, get_amps, remove_amp, server_amp_info},
     auth::{exchange, health, login, logout, refresh, register, validate},
+    oauth::{discord_callback, discord_start, discord_unlink, oauth_poll, steam_callback, steam_start, steam_unlink},
     promo::{redeem_promo, validate_promo},
-    stripe::{confirm_payment, create_checkout_session, create_subscription, stripe_webhook},
+    shop::{buy_ichor_checkout, premium_with_ichor},
+    stripe::{confirm_payment, create_checkout_session, create_subscription, stripe_webhook, start_identity_verification, identity_status},
     social::{
         accept_friend_request, add_server, create_cloud_server, list_friends,
         list_incoming_requests, list_servers, register_server, remove_server, send_friend_request,
@@ -105,10 +115,42 @@ async fn jwks_handler(state: State<Arc<AppState>>) -> impl IntoResponse {
 pub struct AppState {
     pub db: PgPool,
     pub signing_key: Arc<SigningKey>,
-    /// Rate limiter shared across auth endpoints (login/register/refresh).
-    /// 10 requests per 60 seconds per client IP by default; override with
-    /// AUTH_RATE_LIMIT_REQUESTS and AUTH_RATE_LIMIT_WINDOW_SECS env vars.
     pub auth_rate_limiter: Arc<RateLimiter>,
+    // Discord OAuth2
+    pub discord_client_id: String,
+    pub discord_client_secret: String,
+    pub discord_redirect_uri: String,
+    // Steam OpenID
+    pub steam_api_key: String,
+    pub steam_redirect_uri: String,
+    pub steam_realm: String,
+}
+
+// ─── Status heartbeat ─────────────────────────────────────────────────────────
+
+fn spawn_heartbeat(key: &'static str) {
+    let url = std::env::var("ZSTATUS_URL")
+        .unwrap_or_else(|_| "http://zstatus:8004".to_string());
+    let secret = std::env::var("ZSTATUS_SECRET").unwrap_or_default();
+
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("heartbeat client");
+        let endpoint = format!("{}/heartbeat", url);
+        loop {
+            let body = serde_json::json!({ "key": key, "ok": true });
+            let mut req = client.post(&endpoint).json(&body);
+            if !secret.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", secret));
+            }
+            if let Err(e) = req.send().await {
+                eprintln!("[heartbeat] zstatus unreachable: {e}");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -176,6 +218,12 @@ async fn main() {
         db: pool,
         signing_key,
         auth_rate_limiter: Arc::new(RateLimiter::new(rate_limit_requests, rate_limit_window)),
+        discord_client_id:     std::env::var("DISCORD_CLIENT_ID").unwrap_or_default(),
+        discord_client_secret: std::env::var("DISCORD_CLIENT_SECRET").unwrap_or_default(),
+        discord_redirect_uri:  std::env::var("DISCORD_REDIRECT_URI").unwrap_or_default(),
+        steam_api_key:         std::env::var("STEAM_API_KEY").unwrap_or_default(),
+        steam_redirect_uri:    std::env::var("STEAM_REDIRECT_URI").unwrap_or_default(),
+        steam_realm:           std::env::var("STEAM_REALM").unwrap_or_default(),
     });
 
     let app = Router::new()
@@ -214,6 +262,14 @@ async fn main() {
         .route("/account/recovery-codes",        post(generate_recovery_codes_handler))
         .route("/account/recovery-codes/status", get(recovery_codes_status))
         .route("/attachments/:id", get(get_attachment))
+        // OAuth
+        .route("/oauth/discord/start",    post(discord_start))
+        .route("/oauth/discord/callback", get(discord_callback))
+        .route("/oauth/discord",          delete(discord_unlink))
+        .route("/oauth/steam/start",      post(steam_start))
+        .route("/oauth/steam/callback",   get(steam_callback))
+        .route("/oauth/steam",            delete(steam_unlink))
+        .route("/oauth/poll",             get(oauth_poll))
         // Social & multi-server
         .route("/servers/register", post(register_server))
         .route("/servers/cloud", post(create_cloud_server))
@@ -224,17 +280,45 @@ async fn main() {
         .route("/friends", post(send_friend_request))
         .route("/friends/:id/accept", put(accept_friend_request))
         .route("/friend-requests", get(list_incoming_requests))
+        // Amps (server boosts for Radiant subscribers)
+        .route("/amps", get(get_amps))
+        .route("/amps/apply", post(apply_amp))
+        .route("/amps/remove", post(remove_amp))
+        .route("/amps/server", get(server_amp_info))
         // Promo codes
         .route("/promo/validate", post(validate_promo))
         .route("/promo/redeem", post(redeem_promo))
+        .route("/shop/buy-ichor", post(buy_ichor_checkout))
+        .route("/shop/premium-with-ichor", post(premium_with_ichor))
         // Stripe
         .route("/stripe/checkout", post(create_checkout_session))
         .route("/stripe/subscribe", post(create_subscription))
         .route("/stripe/confirm", post(confirm_payment))
         .route("/stripe/webhook", post(stripe_webhook))
+        .route("/stripe/identity/start", post(start_identity_verification))
+        .route("/stripe/identity/status", get(identity_status))
+        // Admin — all routes require valid JWT; identity is taken from JWT claims only
+        .route("/admin/me",                   get(admin_me))
+        .route("/admin/stats",                get(admin_stats))
+        .route("/admin/users",                get(admin_list_users))
+        .route("/admin/users/:id/lock",       post(admin_lock_user))
+        .route("/admin/users/:id/unlock",     post(admin_unlock_user))
+        .route("/admin/staff",                get(admin_list_staff))
+        .route("/admin/staff",                post(admin_add_staff))
+        .route("/admin/staff/:uid",           delete(admin_remove_staff))
+        .route("/admin/promos",               get(admin_list_promos))
+        .route("/admin/promos",               post(admin_create_promo))
+        .route("/admin/promos/:code",         delete(admin_delete_promo))
+        .route("/admin/bans",                 get(admin_list_bans))
+        .route("/admin/broadcasts",           get(admin_list_broadcasts))
+        .route("/admin/broadcasts",           post(admin_send_broadcast))
+        .route("/admin/servers",              get(admin_list_servers))
+        .route("/admin/servers",              delete(admin_delete_server))
         .with_state(state)
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(build_cors_layer());
+
+    spawn_heartbeat("api");
 
     println!("Zeeble auth server running on http://localhost:8001");
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8001")

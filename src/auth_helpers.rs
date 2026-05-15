@@ -62,6 +62,7 @@ pub fn make_access_token(
     account_type: &AccountType,
     premium: bool,
     verified: bool,
+    age_verified: bool,
     avatar_attachment_id: Option<i64>,
     display_name: Option<String>,
 ) -> Result<String, Error> {
@@ -73,6 +74,7 @@ pub fn make_access_token(
         account_type: account_type.as_str().to_string(),
         premium,
         verified,
+        age_verified,
         exp,
         aud: None,
         avatar_attachment_id,

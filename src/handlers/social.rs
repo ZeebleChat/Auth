@@ -12,7 +12,7 @@ use crate::auth_helpers::extract_token;
 use crate::beam::make_beam_identity;
 use crate::models::{
     AddServerRequest, CreateCloudServerRequest, ErrorResponse, FriendIdPath, FriendRequestSummary,
-    FriendSummary, RegisterServerRequest, SendFriendRequest, ServerSummary, UrlPath,
+    FriendSummary, ParentalControls, RegisterServerRequest, SendFriendRequest, ServerSummary, UrlPath,
 };
 
 // ── Servers ───────────────────────────────────────────────────────────────────
@@ -119,6 +119,23 @@ pub async fn add_server(
     Json(req): Json<AddServerRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     let claims = extract_token(&*state.signing_key, &headers).await?;
+
+    if claims.account_type == "child" {
+        let pc_val: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT parental_controls FROM users WHERE id = $1",
+        )
+        .bind(&claims.uid)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+        let pc: ParentalControls = pc_val.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        if !pc.can_join_servers {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse { error: "Joining servers is disabled by parental controls".into() }),
+            ));
+        }
+    }
 
     let server_url = req.server_url.trim().to_string();
     if server_url.is_empty() {
@@ -232,6 +249,23 @@ pub async fn remove_server(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     let claims = extract_token(&*state.signing_key, &headers).await?;
 
+    if claims.account_type == "child" {
+        let pc_val: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT parental_controls FROM users WHERE id = $1",
+        )
+        .bind(&claims.uid)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+        let pc: ParentalControls = pc_val.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        if !pc.can_leave_servers {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse { error: "Leaving servers is disabled by parental controls".into() }),
+            ));
+        }
+    }
+
     let result = sqlx::query(
         "DELETE FROM user_servers WHERE user_id = $1 AND server_url = $2",
     )
@@ -333,7 +367,7 @@ pub async fn create_cloud_server(
         .json(&serde_json::json!({
             "name":     req.name,
             "about":    req.about,
-            "owner_id": claims.uid,
+            "owner_id": claims.sub,
         }))
         .send()
         .await

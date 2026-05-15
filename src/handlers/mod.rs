@@ -1,5 +1,9 @@
 pub mod account;
+pub mod admin;
+pub mod amps;
 pub mod auth;
+pub mod oauth;
 pub mod promo;
+pub mod shop;
 pub mod social;
 pub mod stripe;

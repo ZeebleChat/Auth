@@ -37,11 +37,11 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /build/target/release/zeeble-auth /usr/local/bin/zeeble-auth
 
-# Expose auth server port
-EXPOSE 3001
+EXPOSE 8001
 
-# Declare volume
 VOLUME /keys
 
-# Run the auth server
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD wget -qO- http://localhost:8001/health || exit 1
+
 CMD ["zeeble-auth"]

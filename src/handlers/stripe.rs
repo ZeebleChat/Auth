@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::Sha256;
 
-use crate::{AppState, auth_helpers::extract_token};
+use crate::{AppState, auth_helpers::extract_token, handlers::amps::{grant_amps, revoke_amps}};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -399,6 +399,147 @@ pub async fn create_checkout_session(
     }
 }
 
+// ─── POST /stripe/identity/start ─────────────────────────────────────────────
+// Creates a Stripe Identity VerificationSession for age verification.
+// Returns { client_secret, url } so the frontend can open the Stripe Identity modal.
+
+pub async fn start_identity_verification(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let claims = match extract_token(&state.signing_key, &headers).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    if claims.age_verified {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Already age verified"})),
+        )
+            .into_response();
+    }
+
+    let secret_key = match std::env::var("STRIPE_SECRET_KEY") {
+        Ok(k) => k,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Stripe not configured"})),
+            )
+                .into_response()
+        }
+    };
+
+    let return_url = std::env::var("STRIPE_IDENTITY_RETURN_URL")
+        .unwrap_or_else(|_| "https://zeeble.xyz".to_string());
+
+    let client = reqwest::Client::new();
+
+    let params = [
+        ("type", "document"),
+        ("options[document][require_live_capture]", "false"),
+        ("options[document][require_matching_selfie]", "true"),
+        ("metadata[user_id]", claims.uid.as_str()),
+        ("return_url", return_url.as_str()),
+    ];
+
+    let res = match client
+        .post("https://api.stripe.com/v1/identity/verification_sessions")
+        .basic_auth(&secret_key, Some(""))
+        .form(&params)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to contact Stripe"})),
+            )
+                .into_response()
+        }
+    };
+
+    let data: serde_json::Value = match res.json().await {
+        Ok(d) => d,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Invalid Stripe response"})),
+            )
+                .into_response()
+        }
+    };
+
+    let session_id = match data.get("id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("No session id in Stripe response: {data}")})),
+            )
+                .into_response()
+        }
+    };
+
+    let client_secret = match data.get("client_secret").and_then(|v| v.as_str()) {
+        Some(cs) => cs.to_string(),
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "No client_secret in Stripe response"})),
+            )
+                .into_response()
+        }
+    };
+
+    let url = data.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    // Store the session ID on the user row for webhook correlation
+    let _ = sqlx::query(
+        "UPDATE users SET stripe_identity_session_id = $1 WHERE id = $2",
+    )
+    .bind(&session_id)
+    .bind(&claims.uid)
+    .execute(&state.db)
+    .await;
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "client_secret": client_secret,
+            "url": url,
+            "session_id": session_id,
+        })),
+    )
+        .into_response()
+}
+
+// ─── GET /stripe/identity/status ─────────────────────────────────────────────
+
+pub async fn identity_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let claims = match extract_token(&state.signing_key, &headers).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    let row: Option<(bool,)> = sqlx::query_as(
+        "SELECT age_verified FROM users WHERE id = $1",
+    )
+    .bind(&claims.uid)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    let age_verified = row.map(|(v,)| v).unwrap_or(false);
+
+    (StatusCode::OK, Json(json!({ "age_verified": age_verified }))).into_response()
+}
+
 // ─── POST /stripe/webhook ─────────────────────────────────────────────────────
 
 pub async fn stripe_webhook(
@@ -455,7 +596,32 @@ pub async fn stripe_webhook(
     };
 
     match event.get("type").and_then(|t| t.as_str()) {
-        // Payment succeeded — activate premium
+        // Ichor one-time purchase completed
+        Some("checkout.session.completed") => {
+            let purchase_type = event
+                .pointer("/data/object/metadata/purchase_type")
+                .and_then(|v| v.as_str());
+            let user_id = event
+                .pointer("/data/object/metadata/user_id")
+                .and_then(|v| v.as_str());
+            let ichor_amount = event
+                .pointer("/data/object/metadata/ichor_amount")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<i64>().ok());
+
+            if purchase_type == Some("ichor") {
+                if let (Some(uid), Some(amount)) = (user_id, ichor_amount) {
+                    let _ = sqlx::query(
+                        "UPDATE users SET ichor_balance = ichor_balance + $1 WHERE id = $2",
+                    )
+                    .bind(amount)
+                    .bind(uid)
+                    .execute(&state.db)
+                    .await;
+                }
+            }
+        }
+        // Payment succeeded — activate premium and grant Amps on first subscription
         Some("invoice.payment_succeeded") => {
             if let Some(user_id) = event
                 .pointer("/data/object/subscription_details/metadata/user_id")
@@ -468,9 +634,10 @@ pub async fn stripe_webhook(
                 .bind(user_id)
                 .execute(&state.db)
                 .await;
+                grant_amps(&state.db, user_id).await;
             }
         }
-        // Subscription cancelled or payment failed — revoke premium
+        // Subscription cancelled or payment failed — revoke premium and all Amps
         Some("customer.subscription.deleted") | Some("invoice.payment_failed") => {
             if let Some(user_id) = event
                 .pointer("/data/object/metadata/user_id")
@@ -482,6 +649,51 @@ pub async fn stripe_webhook(
                 .bind(user_id)
                 .execute(&state.db)
                 .await;
+                revoke_amps(&state.db, user_id).await;
+            }
+        }
+        // Identity verified — check age >= 18 then set age_verified
+        Some("identity.verification_session.verified") => {
+            let user_id = event
+                .pointer("/data/object/metadata/user_id")
+                .and_then(|v| v.as_str());
+
+            if let Some(uid) = user_id {
+                let dob_year = event
+                    .pointer("/data/object/verified_outputs/dob/year")
+                    .and_then(|v| v.as_i64());
+                let dob_month = event
+                    .pointer("/data/object/verified_outputs/dob/month")
+                    .and_then(|v| v.as_i64());
+                let dob_day = event
+                    .pointer("/data/object/verified_outputs/dob/day")
+                    .and_then(|v| v.as_i64());
+
+                let is_18_plus = match (dob_year, dob_month, dob_day) {
+                    (Some(y), Some(m), Some(d)) => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        // Rough age check: seconds since epoch / seconds per year
+                        let birth_approx = (y as u64).saturating_sub(1970) * 365 * 86400
+                            + (m as u64).saturating_sub(1) * 30 * 86400
+                            + (d as u64).saturating_sub(1) * 86400;
+                        let age_secs = now.saturating_sub(birth_approx);
+                        age_secs >= 18 * 365 * 86400
+                    }
+                    // No DOB in response — trust that Stripe verified the document
+                    _ => true,
+                };
+
+                if is_18_plus {
+                    let _ = sqlx::query(
+                        "UPDATE users SET age_verified = TRUE WHERE id = $1",
+                    )
+                    .bind(uid)
+                    .execute(&state.db)
+                    .await;
+                }
             }
         }
         _ => {}

@@ -21,7 +21,7 @@ use crate::beam::{
 };
 use crate::models::{
     AUTH_PASSKEY, AUTH_PASSWORD, AUTH_TOTP, AccessTokenResponse, AccountInfoResponse, AccountType,
-    BotSummary, SubAction, SubActionRequest, CreateSubAccountRequest, ErrorResponse,
+    BotSummary, ParentalControls, SubAction, SubActionRequest, CreateSubAccountRequest, ErrorResponse,
     FriendSummary, RecoveryCodesRequest, RecoveryCodesResponse, RecoveryCodesStatusResponse,
     RotateBotTokenRequest, ServerSummary, SubAccountIdPath, SubAccountSummary,
     SwitchAltRequest, TotpDisableRequest, TotpEnableRequest, TotpSetupRequest, TotpSetupResponse,
@@ -55,7 +55,7 @@ pub async fn switch_alt(
     }
 
     let row = sqlx::query(
-        "SELECT display_name, beam_tag, premium, verified, avatar_attachment_id
+        "SELECT display_name, beam_tag, premium, verified, age_verified, avatar_attachment_id
          FROM users WHERE id = $1 AND parent_id = $2 AND account_type = 'alt'",
     )
     .bind(&req.alt_id)
@@ -84,6 +84,7 @@ pub async fn switch_alt(
     let beam_tag: String = row.try_get("beam_tag").map_err(|_| db_err())?;
     let premium: bool = row.try_get("premium").unwrap_or(false);
     let verified: bool = row.try_get("verified").unwrap_or(false);
+    let age_verified: bool = row.try_get("age_verified").unwrap_or(false);
     let avatar_attachment_id: Option<i64> = row.try_get("avatar_attachment_id").unwrap_or(None);
 
     let beam_identity = make_beam_identity(&display_name, &beam_tag, "alt");
@@ -96,6 +97,7 @@ pub async fn switch_alt(
         &AccountType::Alt,
         premium,
         verified,
+        age_verified,
         avatar_attachment_id,
         Some(display_name.clone()),
     )
@@ -517,6 +519,32 @@ pub async fn sub_action(
             .await
             .ok();
         }
+        SubAction::SetParentalControls { controls } => {
+            let is_child: bool = sqlx::query_scalar(
+                "SELECT account_type = 'child' FROM users WHERE id = $1",
+            )
+            .bind(&req.sub_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(false);
+
+            if !is_child {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error: "Parental controls only apply to child accounts".into() }),
+                ));
+            }
+
+            let controls_json = serde_json::to_value(&controls)
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Serialization error".into() })))?;
+
+            sqlx::query("UPDATE users SET parental_controls = $1 WHERE id = $2")
+                .bind(&controls_json)
+                .bind(&req.sub_id)
+                .execute(&state.db)
+                .await
+                .ok();
+        }
     }
 
     Ok(StatusCode::OK)
@@ -715,7 +743,7 @@ pub async fn update_display_name(
     }
 
     let row = sqlx::query(
-        "SELECT beam_tag, premium, verified, account_type, avatar_attachment_id FROM users WHERE id = $1",
+        "SELECT beam_tag, premium, verified, age_verified, account_type, avatar_attachment_id FROM users WHERE id = $1",
     )
     .bind(&claims.uid)
     .fetch_optional(&state.db)
@@ -741,6 +769,7 @@ pub async fn update_display_name(
     let beam_tag: String = row.try_get("beam_tag").map_err(|_| db_err())?;
     let premium: bool = row.try_get("premium").unwrap_or(false);
     let verified: bool = row.try_get("verified").unwrap_or(false);
+    let age_verified: bool = row.try_get("age_verified").unwrap_or(false);
     let account_type_str: String = row.try_get("account_type").map_err(|_| db_err())?;
     let avatar_attachment_id: Option<i64> = row.try_get("avatar_attachment_id").unwrap_or(None);
 
@@ -788,6 +817,7 @@ pub async fn update_display_name(
         &account_type,
         premium,
         verified,
+        age_verified,
         avatar_attachment_id,
         Some(new_name.clone()),
     )
@@ -933,7 +963,7 @@ pub async fn update_beam_tag(
     }
 
     let row = sqlx::query(
-        "SELECT display_name, premium, verified, account_type, avatar_attachment_id FROM users WHERE id = $1",
+        "SELECT display_name, premium, verified, age_verified, account_type, avatar_attachment_id FROM users WHERE id = $1",
     )
     .bind(&claims.uid)
     .fetch_optional(&state.db)
@@ -959,6 +989,7 @@ pub async fn update_beam_tag(
     let display_name: String = row.try_get("display_name").map_err(|_| db_err())?;
     let premium: bool = row.try_get("premium").unwrap_or(false);
     let verified: bool = row.try_get("verified").unwrap_or(false);
+    let age_verified: bool = row.try_get("age_verified").unwrap_or(false);
     let account_type_str: String = row.try_get("account_type").map_err(|_| db_err())?;
     let avatar_attachment_id: Option<i64> = row.try_get("avatar_attachment_id").unwrap_or(None);
 
@@ -1005,6 +1036,7 @@ pub async fn update_beam_tag(
         &account_type,
         premium,
         verified,
+        age_verified,
         avatar_attachment_id,
         Some(display_name.clone()),
     )
@@ -1028,7 +1060,7 @@ pub async fn account_info(
     })?;
 
     let row = sqlx::query(
-        "SELECT display_name, beam_tag, premium, verified, discord_id, auth_methods, avatar_attachment_id, banner_attachment_id, email
+        "SELECT display_name, beam_tag, premium, verified, age_verified, ichor_balance, discord_id, steam_id, auth_methods, avatar_attachment_id, banner_attachment_id, email
          FROM users WHERE id = $1",
     )
     .bind(&claims.uid)
@@ -1056,7 +1088,10 @@ pub async fn account_info(
     let beam_tag: String = row.try_get("beam_tag").map_err(|_| db_err())?;
     let premium: bool = row.try_get("premium").unwrap_or(false);
     let verified: bool = row.try_get("verified").unwrap_or(false);
+    let age_verified: bool = row.try_get("age_verified").unwrap_or(false);
+    let ichor_balance: i64 = row.try_get("ichor_balance").unwrap_or(0);
     let discord_id: Option<String> = row.try_get("discord_id").unwrap_or(None);
+    let steam_id: Option<String> = row.try_get("steam_id").unwrap_or(None);
     let auth_methods: Option<i64> = row.try_get("auth_methods").unwrap_or(None);
     let avatar_attachment_id: Option<i64> = row.try_get("avatar_attachment_id").unwrap_or(None);
     let banner_attachment_id: Option<i64> = row.try_get("banner_attachment_id").unwrap_or(None);
@@ -1069,7 +1104,7 @@ pub async fn account_info(
 
     if claims.account_type == "primary" {
         let sub_rows = sqlx::query(
-            "SELECT id, display_name, beam_tag, account_type, locked, bot_token_version
+            "SELECT id, display_name, beam_tag, account_type, locked, bot_token_version, parental_controls
              FROM users WHERE parent_id = $1",
         )
         .bind(&claims.uid)
@@ -1093,14 +1128,22 @@ pub async fn account_info(
                     display_name: dn,
                     account_type: atype,
                     locked,
+                    parental_controls: None,
                 }),
-                "child" => children.push(SubAccountSummary {
-                    id,
-                    beam_identity,
-                    display_name: dn,
-                    account_type: atype,
-                    locked,
-                }),
+                "child" => {
+                    let pc: ParentalControls = sub_row.try_get::<serde_json::Value, _>("parental_controls")
+                        .ok()
+                        .and_then(|v| serde_json::from_value(v).ok())
+                        .unwrap_or_default();
+                    children.push(SubAccountSummary {
+                        id,
+                        beam_identity,
+                        display_name: dn,
+                        account_type: atype,
+                        locked,
+                        parental_controls: Some(pc),
+                    });
+                }
                 "bot" => {
                     let token = match make_bot_token(
                         &*state.signing_key,
@@ -1127,6 +1170,7 @@ pub async fn account_info(
                     display_name: dn,
                     account_type: atype,
                     locked,
+                    parental_controls: None,
                 }),
                 _ => {}
             }
@@ -1204,7 +1248,10 @@ pub async fn account_info(
         account_type: claims.account_type,
         premium,
         verified,
+        age_verified,
+        ichor_balance,
         discord_linked: discord_id.is_some(),
+        steam_linked: steam_id.is_some(),
         auth_methods: methods,
         alts,
         children,

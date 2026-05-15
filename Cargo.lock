@@ -3667,6 +3667,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "hex",
+ "hmac",
  "jsonwebtoken",
  "multer",
  "pkcs8",

@@ -1,0 +1,2 @@
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS parental_controls JSONB NOT NULL DEFAULT '{}';

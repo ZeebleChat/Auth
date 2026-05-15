@@ -128,6 +128,7 @@ pub async fn register(
         &AccountType::Primary,
         false,
         false,
+        false,
         None,
         Some(display_name.clone()),
     )
@@ -163,42 +164,69 @@ pub async fn login(
             }),
         ));
     }
-    let (display_name, beam_tag) = crate::beam::split_beam(&req.beam_identity);
 
-    if beam_tag.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "Use name»tag format (e.g. sarah»k4mx9)".into(),
-            }),
-        ));
-    }
-
-    let row = sqlx::query(
-        "SELECT id, password_hash, auth_methods, totp_secret, totp_backup_codes, account_type,
-                premium, verified, parent_id, locked, avatar_attachment_id
-         FROM users WHERE display_name = $1 AND beam_tag = $2",
-    )
-    .bind(&display_name)
-    .bind(&beam_tag)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Database error".into(),
-            }),
-        )
-    })?
-    .ok_or_else(|| {
+    let invalid_creds = || {
         (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
-                error: "Invalid beam identity or password".into(),
+                error: "Invalid credentials".into(),
             }),
         )
-    })?;
+    };
+
+    let row = if let Some(ref email) = req.email {
+        let email = email.trim().to_lowercase();
+        sqlx::query(
+            "SELECT id, display_name, beam_tag, password_hash, auth_methods, totp_secret,
+                    totp_backup_codes, account_type, premium, verified, age_verified,
+                    parent_id, locked, avatar_attachment_id
+             FROM users WHERE email = $1",
+        )
+        .bind(&email)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: "Database error".into() }),
+            )
+        })?
+        .ok_or_else(invalid_creds)?
+    } else if let Some(ref bi) = req.beam_identity {
+        let (dn, bt) = crate::beam::split_beam(bi);
+        if bt.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Use name»tag format (e.g. sarah»k4mx9)".into(),
+                }),
+            ));
+        }
+        sqlx::query(
+            "SELECT id, display_name, beam_tag, password_hash, auth_methods, totp_secret,
+                    totp_backup_codes, account_type, premium, verified, age_verified,
+                    parent_id, locked, avatar_attachment_id
+             FROM users WHERE display_name = $1 AND beam_tag = $2",
+        )
+        .bind(&dn)
+        .bind(&bt)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: "Database error".into() }),
+            )
+        })?
+        .ok_or_else(invalid_creds)?
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Provide either email or beam identity".into(),
+            }),
+        ));
+    };
 
     let db_err = || {
         (
@@ -207,6 +235,8 @@ pub async fn login(
         )
     };
     let id: String = row.try_get("id").map_err(|_| db_err())?;
+    let display_name: String = row.try_get("display_name").map_err(|_| db_err())?;
+    let beam_tag: String = row.try_get("beam_tag").map_err(|_| db_err())?;
     let password_hash: Option<String> = row.try_get("password_hash").unwrap_or(None);
     let auth_methods: Option<i64> = row.try_get("auth_methods").unwrap_or(None);
     let totp_secret: Option<String> = row.try_get("totp_secret").unwrap_or(None);
@@ -214,6 +244,7 @@ pub async fn login(
     let account_type_str: String = row.try_get("account_type").map_err(|_| db_err())?;
     let premium: bool = row.try_get("premium").unwrap_or(false);
     let verified: bool = row.try_get("verified").unwrap_or(false);
+    let age_verified: bool = row.try_get("age_verified").unwrap_or(false);
     let parent_id: Option<String> = row.try_get("parent_id").unwrap_or(None);
     let locked: bool = row.try_get("locked").unwrap_or(false);
     let avatar_attachment_id: Option<i64> = row.try_get("avatar_attachment_id").unwrap_or(None);
@@ -323,6 +354,7 @@ pub async fn login(
         &account_type,
         premium,
         verified,
+        age_verified,
         avatar_attachment_id,
         Some(display_name.clone()),
     )
@@ -360,7 +392,7 @@ pub async fn refresh(
     }
     let row = sqlx::query(
         "SELECT display_name, beam_tag, refresh_token_hash, account_type, parent_id,
-                premium, verified, avatar_attachment_id
+                premium, verified, age_verified, avatar_attachment_id
          FROM users WHERE id = $1",
     )
     .bind(&req.uid)
@@ -396,6 +428,7 @@ pub async fn refresh(
     let parent_id: Option<String> = row.try_get("parent_id").unwrap_or(None);
     let premium: bool = row.try_get("premium").unwrap_or(false);
     let verified: bool = row.try_get("verified").unwrap_or(false);
+    let age_verified: bool = row.try_get("age_verified").unwrap_or(false);
     let avatar_attachment_id: Option<i64> = row.try_get("avatar_attachment_id").unwrap_or(None);
 
     let stored_hash = refresh_hash.ok_or_else(|| {
@@ -427,6 +460,7 @@ pub async fn refresh(
         &account_type,
         premium,
         verified,
+        age_verified,
         avatar_attachment_id,
         Some(display_name.clone()),
     )
@@ -532,6 +566,7 @@ pub async fn exchange(
             account_type: claims.account_type,
             premium: claims.premium,
             verified: claims.verified,
+            age_verified: claims.age_verified,
             exp,
             aud: Some(body.server_url.clone()),
             avatar_attachment_id: claims.avatar_attachment_id,
@@ -565,6 +600,7 @@ pub async fn exchange(
                 account_type: bot.account_type,
                 premium: false,
                 verified: false,
+                age_verified: false,
                 exp,
                 aud: Some(body.server_url.clone()),
                 avatar_attachment_id: None,
